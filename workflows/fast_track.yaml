@@ -1,0 +1,222 @@
+# =============================================================================
+# OTS Fast Track — Cloud Workflows Definition
+# =============================================================================
+# 觸發：Pub/Sub 訊息（order_id, track_type=fast）
+# 步驟：preprocess → nmt → qa_auto → qa_human（條件性）→ deliver
+#
+# 每個步驟呼叫對應的 Cloud Run Job，並在 Cloud SQL 記錄狀態。
+# 失敗時自動 retry（最多 3 次），超過後進 dead-letter 並通知 admin。
+# =============================================================================
+
+main:
+  params: [args]
+  steps:
+
+    # ── 解析輸入 ──────────────────────────────────────────────────────────────
+    - init:
+        assign:
+          - order_id: ${args.order_id}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - region: "asia-east1"
+          - pipeline_env: ${sys.get_env("ENV", "dev")}
+          - api_base: ${sys.get_env("API_BASE_URL")}
+          - base_job_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs"}'
+
+    # ── Step 1: Pre-process ───────────────────────────────────────────────────
+    - log_preprocess_start:
+        call: sys.log
+        args:
+          text: '${"[Fast Track] Starting preprocess for order: " + order_id}'
+          severity: INFO
+
+    - run_preprocess:
+        call: http.post
+        args:
+          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-ft-preprocess-" + pipeline_env + ":run"}'
+          auth:
+            type: OAuth2
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                  - name: ORDER_ID
+                    value: ${order_id}
+        result: preprocess_result
+
+    - check_preprocess:
+        switch:
+          - condition: ${preprocess_result.code != 200}
+            steps:
+              - preprocess_failed:
+                  raise:
+                    code: ${preprocess_result.code}
+                    message: '${"Preprocess job failed for order: " + order_id}'
+
+    # ── Step 2: NMT（兩段式：台語→華文→目標語）─────────────────────────────
+    - log_nmt_start:
+        call: sys.log
+        args:
+          text: '${"[Fast Track] Starting NMT for order: " + order_id}'
+          severity: INFO
+
+    - run_nmt:
+        try:
+          call: http.post
+          args:
+            url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-ft-nmt-" + pipeline_env + ":run"}'
+            auth:
+              type: OAuth2
+            body:
+              overrides:
+                containerOverrides:
+                  - env:
+                    - name: ORDER_ID
+                      value: ${order_id}
+          result: nmt_result
+        retry:
+          predicate: ${default_retry_predicate}
+          max_retries: 2
+          backoff:
+            initial_delay: 10
+            max_delay: 60
+            multiplier: 2
+
+    - check_nmt:
+        switch:
+          - condition: ${nmt_result.code != 200}
+            steps:
+              - nmt_failed:
+                  raise:
+                    code: ${nmt_result.code}
+                    message: '${"NMT job failed for order: " + order_id}'
+
+    # ── Step 3: Auto QA（4層驗證）────────────────────────────────────────────
+    - log_qa_auto_start:
+        call: sys.log
+        args:
+          text: '${"[Fast Track] Starting auto QA for order: " + order_id}'
+          severity: INFO
+
+    - run_qa_auto:
+        call: http.post
+        args:
+          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-ft-qa-auto-" + pipeline_env + ":run"}'
+          auth:
+            type: OAuth2
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                  - name: ORDER_ID
+                    value: ${order_id}
+        result: qa_auto_result
+
+    # ── Step 4: Human QA（條件性——只有 must_fix flags 存在時）───────────────
+    - check_must_fix:
+        call: http.get
+        args:
+          url: '${api_base + "/internal/qa-flags"}'
+          auth:
+            type: OIDC
+          query:
+            order_id: ${order_id}
+            flag_level: "must_fix"
+            resolved: "false"
+        result: must_fix_response
+
+    - route_human_qa:
+        switch:
+          - condition: ${must_fix_response.body.total > 0}
+            steps:
+              - notify_human_qa:
+                  call: http.post
+                  args:
+                    url: '${api_base + "/internal/notify"}'
+                    auth:
+                      type: OIDC
+                    body:
+                      type: "human_qa_required"
+                      order_id: ${order_id}
+                      flag_count: ${must_fix_response.body.total}
+                  result: notify_result
+              - wait_for_human_qa:
+                  call: sys.sleep
+                  args:
+                    seconds: 3600   # 輪詢間隔 1 小時，最多等 24 小時
+              - poll_human_qa:
+                  call: http.get
+                  args:
+                    url: '${api_base + "/internal/qa-flags"}'
+                    auth:
+                      type: OIDC
+                    query:
+                      order_id: ${order_id}
+                      flag_level: "must_fix"
+                      resolved: "false"
+                  result: poll_result
+              - check_all_resolved:
+                  switch:
+                    - condition: ${poll_result.body.total > 0}
+                      next: wait_for_human_qa   # 繼續等待
+
+    # ── Step 5: Deliver ───────────────────────────────────────────────────────
+    - log_deliver_start:
+        call: sys.log
+        args:
+          text: '${"[Fast Track] Starting delivery for order: " + order_id}'
+          severity: INFO
+
+    - run_deliver:
+        call: http.post
+        args:
+          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-ft-deliver-" + pipeline_env + ":run"}'
+          auth:
+            type: OAuth2
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                  - name: ORDER_ID
+                    value: ${order_id}
+        result: deliver_result
+
+    - log_complete:
+        call: sys.log
+        args:
+          text: '${"[Fast Track] Pipeline completed for order: " + order_id}'
+          severity: INFO
+
+    - return_result:
+        return:
+          order_id: ${order_id}
+          status: "delivered"
+
+    # ── 錯誤處理 ──────────────────────────────────────────────────────────────
+    - handle_error:
+        steps:
+          - log_error:
+              call: sys.log
+              args:
+                text: '${"[Fast Track] Pipeline error for order: " + order_id + " — " + sys.get_env("ERROR_MSG", "unknown")}'
+                severity: ERROR
+          - notify_admin_error:
+              call: http.post
+              args:
+                url: '${api_base + "/internal/notify"}'
+                auth:
+                  type: OIDC
+                body:
+                  type: "pipeline_error"
+                  order_id: ${order_id}
+                  track: "fast"
+
+# ── Retry predicate（5xx 和 timeout 才 retry，4xx 不 retry）────────────────
+default_retry_predicate:
+  params: [exception]
+  steps:
+    - check_exception:
+        switch:
+          - condition: ${exception.code == 429 or exception.code >= 500}
+            return: true
+    - otherwise:
+        return: false

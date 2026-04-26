@@ -1,0 +1,263 @@
+# =============================================================================
+# OTS Literary Track — Cloud Workflows Definition
+# =============================================================================
+# 觸發：Pub/Sub 訊息（order_id, track_type=literary）
+# 步驟：preprocess+nmt → notify_editor → wait_editor → notify_proofreader
+#        → wait_proofreader → qa_checklist → deliver
+#
+# Literary Track 的人工步驟（editor, proofreader）透過輪詢 API 確認完成狀態，
+# 不用 webhook，避免長時間等待的 workflow state 管理複雜化。
+# =============================================================================
+
+main:
+  params: [args]
+  steps:
+
+    # ── 解析輸入 ──────────────────────────────────────────────────────────────
+    - init:
+        assign:
+          - order_id: ${args.order_id}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - region: "asia-east1"
+          - pipeline_env: ${sys.get_env("ENV", "dev")}
+          - api_base: ${sys.get_env("API_BASE_URL")}
+          - api_base: '${"https://ots-api-backend-" + pipeline_env + "-" + project_id + ".asia-east1.run.app"}'
+          - poll_interval: 3600    # 每小時輪詢一次
+          - editor_timeout: 172800  # 48 小時 editor timeout
+
+    # ── Step 1: Pre-process + NMT（AI 初稿）──────────────────────────────────
+    - log_nmt_start:
+        call: sys.log
+        args:
+          text: '${"[Literary Track] Starting preprocess+NMT for order: " + order_id}'
+          severity: INFO
+
+    - run_preprocess_nmt:
+        try:
+          call: http.post
+          args:
+            url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-lt-preprocess-nmt-" + pipeline_env + ":run"}'
+            auth:
+              type: OAuth2
+            body:
+              overrides:
+                containerOverrides:
+                  - env:
+                    - name: ORDER_ID
+                      value: ${order_id}
+          result: nmt_result
+        retry:
+          predicate: ${default_retry_predicate}
+          max_retries: 2
+          backoff:
+            initial_delay: 10
+            max_delay: 60
+            multiplier: 2
+
+    # ── Step 2: 通知 Admin 指派編輯 ───────────────────────────────────────────
+    - notify_assign_editor:
+        call: http.post
+        args:
+          url: ${api_base + "/internal/notify"}
+          auth:
+            type: OIDC
+          body:
+            type: "literary_assign_editor"
+            order_id: ${order_id}
+        result: notify_assign_result
+
+    - log_waiting_editor:
+        call: sys.log
+        args:
+          text: '${"[Literary Track] Waiting for editor assignment: " + order_id}'
+          severity: INFO
+
+    # ── Step 3: 等待 editor 完成（輪詢，最多 48 小時）───────────────────────
+    - init_editor_wait:
+        assign:
+          - editor_waited: 0
+          - editor_done: false
+
+    - poll_editor_loop:
+        steps:
+          - check_editor_timeout:
+              switch:
+                - condition: ${editor_waited >= editor_timeout}
+                  steps:
+                    - editor_timeout_notify:
+                        call: http.post
+                        args:
+                          url: ${api_base + "/internal/notify"}
+                          auth:
+                            type: OIDC
+                          body:
+                            type: "literary_editor_timeout"
+                            order_id: ${order_id}
+                    - editor_timeout_error:
+                        raise:
+                          code: 408
+                          message: '${"Editor timeout for order: " + order_id}'
+          - get_assignment_status:
+              call: http.get
+              args:
+                url: ${api_base + "/admin/assignments/" + order_id}
+                auth:
+                  type: OIDC
+              result: assignment_response
+          - check_editor_done:
+              switch:
+                - condition: ${assignment_response.body.status == "editor_done" or assignment_response.body.status == "proofreading" or assignment_response.body.status == "proofread_done" or assignment_response.body.status == "delivered"}
+                  steps:
+                    - mark_editor_done:
+                        assign:
+                          - editor_done: true
+                    - break_editor_loop:
+                        next: after_editor
+          - sleep_editor:
+              call: sys.sleep
+              args:
+                seconds: ${poll_interval}
+          - increment_editor_wait:
+              assign:
+                - editor_waited: ${editor_waited + poll_interval}
+              next: poll_editor_loop
+
+    - after_editor:
+        call: sys.log
+        args:
+          text: '${"[Literary Track] Editor done for order: " + order_id}'
+          severity: INFO
+
+    # ── Step 4: 通知 Admin 指派母語校對 ──────────────────────────────────────
+    - notify_assign_proofreader:
+        call: http.post
+        args:
+          url: ${api_base + "/internal/notify"}
+          auth:
+            type: OIDC
+          body:
+            type: "literary_assign_proofreader"
+            order_id: ${order_id}
+
+    # ── Step 5: 等待 proofreader 完成（最多 24 小時）────────────────────────
+    - init_proof_wait:
+        assign:
+          - proof_waited: 0
+          - proof_timeout: 86400   # 24 小時
+
+    - poll_proof_loop:
+        steps:
+          - check_proof_timeout:
+              switch:
+                - condition: ${proof_waited >= proof_timeout}
+                  steps:
+                    - proof_timeout_notify:
+                        call: http.post
+                        args:
+                          url: ${api_base + "/internal/notify"}
+                          auth:
+                            type: OIDC
+                          body:
+                            type: "literary_proofreader_timeout"
+                            order_id: ${order_id}
+                    - proof_timeout_error:
+                        raise:
+                          code: 408
+                          message: '${"Proofreader timeout for order: " + order_id}'
+          - get_proof_status:
+              call: http.get
+              args:
+                url: ${api_base + "/admin/assignments/" + order_id}
+                auth:
+                  type: OIDC
+              result: proof_response
+          - check_proof_done:
+              switch:
+                - condition: ${proof_response.body.status == "proofread_done" or proof_response.body.status == "delivered"}
+                  next: after_proofreader
+          - sleep_proof:
+              call: sys.sleep
+              args:
+                seconds: ${poll_interval}
+          - increment_proof_wait:
+              assign:
+                - proof_waited: ${proof_waited + poll_interval}
+              next: poll_proof_loop
+
+    - after_proofreader:
+        call: sys.log
+        args:
+          text: '${"[Literary Track] Proofreading done for order: " + order_id}'
+          severity: INFO
+
+    # ── Step 6: Auto QA + Checklist ──────────────────────────────────────────
+    - run_qa_checklist:
+        call: http.post
+        args:
+          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-lt-qa-checklist-" + pipeline_env + ":run"}'
+          auth:
+            type: OAuth2
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                  - name: ORDER_ID
+                    value: ${order_id}
+        result: qa_result
+
+    # ── Step 7: Deliver（試譯包格式化 + 通知）────────────────────────────────
+    - run_deliver:
+        call: http.post
+        args:
+          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-lt-deliver-" + pipeline_env + ":run"}'
+          auth:
+            type: OAuth2
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                  - name: ORDER_ID
+                    value: ${order_id}
+        result: deliver_result
+
+    - log_complete:
+        call: sys.log
+        args:
+          text: '${"[Literary Track] Pipeline completed for order: " + order_id}'
+          severity: INFO
+
+    - return_result:
+        return:
+          order_id: ${order_id}
+          status: "delivered"
+          track: "literary"
+
+    # ── 錯誤處理 ──────────────────────────────────────────────────────────────
+    - handle_error:
+        steps:
+          - log_error:
+              call: sys.log
+              args:
+                text: '${"[Literary Track] Pipeline error for order: " + order_id}'
+                severity: ERROR
+          - notify_admin_error:
+              call: http.post
+              args:
+                url: ${api_base + "/internal/notify"}
+                auth:
+                  type: OIDC
+                body:
+                  type: "pipeline_error"
+                  order_id: ${order_id}
+                  track: "literary"
+
+# ── Retry predicate ───────────────────────────────────────────────────────────
+default_retry_predicate:
+  params: [exception]
+  steps:
+    - check_exception:
+        switch:
+          - condition: ${exception.code == 429 or exception.code >= 500}
+            return: true
+    - otherwise:
+        return: false

@@ -4,7 +4,7 @@
 # 觸發：Pub/Sub 訊息（order_id, track_type=fast）
 # 步驟：preprocess → nmt → qa_auto → qa_human（條件性）→ deliver
 #
-# 每個步驟呼叫對應的 Cloud Run Job，並在 Cloud SQL 記錄狀態。
+# 每個步驟呼叫對應的 Cloud Run Job，並等待執行完成後再繼續下一步。
 # 失敗時自動 retry（最多 3 次），超過後進 dead-letter 並通知 admin。
 # =============================================================================
 
@@ -21,6 +21,7 @@ main:
           - pipeline_env: ${sys.get_env("ENV", "dev")}
           - api_base: ${sys.get_env("API_BASE_URL")}
           - base_job_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs"}'
+          - exec_base_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/"}'
 
     # ── Step 1: Pre-process ───────────────────────────────────────────────────
     - log_preprocess_start:
@@ -32,7 +33,7 @@ main:
     - run_preprocess:
         call: http.post
         args:
-          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-ft-preprocess-" + pipeline_env + ":run"}'
+          url: '${base_job_url + "/ots-ft-preprocess-" + pipeline_env + ":run"}'
           auth:
             type: OAuth2
           body:
@@ -43,16 +44,14 @@ main:
                     value: ${order_id}
         result: preprocess_result
 
-    - check_preprocess:
-        switch:
-          - condition: ${preprocess_result.code != 200}
-            steps:
-              - preprocess_failed:
-                  raise:
-                    code: ${preprocess_result.code}
-                    message: '${"Preprocess job failed for order: " + order_id}'
+    - wait_preprocess:
+        call: wait_for_execution
+        args:
+          exec_url: '${exec_base_url + preprocess_result.body.metadata.name}'
+          step_name: "preprocess"
+          order_id: ${order_id}
 
-    # ── Step 2: NMT（兩段式：台語→華文→目標語）─────────────────────────────
+    # ── Step 2: NMT（台語 → 目標語）──────────────────────────────────────────
     - log_nmt_start:
         call: sys.log
         args:
@@ -63,7 +62,7 @@ main:
         try:
           call: http.post
           args:
-            url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-ft-nmt-" + pipeline_env + ":run"}'
+            url: '${base_job_url + "/ots-ft-nmt-" + pipeline_env + ":run"}'
             auth:
               type: OAuth2
             body:
@@ -81,14 +80,12 @@ main:
             max_delay: 60
             multiplier: 2
 
-    - check_nmt:
-        switch:
-          - condition: ${nmt_result.code != 200}
-            steps:
-              - nmt_failed:
-                  raise:
-                    code: ${nmt_result.code}
-                    message: '${"NMT job failed for order: " + order_id}'
+    - wait_nmt:
+        call: wait_for_execution
+        args:
+          exec_url: '${exec_base_url + nmt_result.body.metadata.name}'
+          step_name: "nmt"
+          order_id: ${order_id}
 
     # ── Step 3: Auto QA（4層驗證）────────────────────────────────────────────
     - log_qa_auto_start:
@@ -100,7 +97,7 @@ main:
     - run_qa_auto:
         call: http.post
         args:
-          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-ft-qa-auto-" + pipeline_env + ":run"}'
+          url: '${base_job_url + "/ots-ft-qa-auto-" + pipeline_env + ":run"}'
           auth:
             type: OAuth2
           body:
@@ -110,6 +107,13 @@ main:
                   - name: ORDER_ID
                     value: ${order_id}
         result: qa_auto_result
+
+    - wait_qa_auto:
+        call: wait_for_execution
+        args:
+          exec_url: '${exec_base_url + qa_auto_result.body.metadata.name}'
+          step_name: "qa_auto"
+          order_id: ${order_id}
 
     # ── Step 4: Human QA（條件性——只有 must_fix flags 存在時）───────────────
     - check_must_fix:
@@ -169,7 +173,7 @@ main:
     - run_deliver:
         call: http.post
         args:
-          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-ft-deliver-" + pipeline_env + ":run"}'
+          url: '${base_job_url + "/ots-ft-deliver-" + pipeline_env + ":run"}'
           auth:
             type: OAuth2
           body:
@@ -179,6 +183,13 @@ main:
                   - name: ORDER_ID
                     value: ${order_id}
         result: deliver_result
+
+    - wait_deliver:
+        call: wait_for_execution
+        args:
+          exec_url: '${exec_base_url + deliver_result.body.metadata.name}'
+          step_name: "deliver"
+          order_id: ${order_id}
 
     - log_complete:
         call: sys.log
@@ -209,6 +220,59 @@ main:
                   type: "pipeline_error"
                   order_id: ${order_id}
                   track: "fast"
+
+
+# ── 等待 Cloud Run Job 執行完成 ───────────────────────────────────────────────
+# Cloud Run Jobs `:run` API 在 execution 建立時即回傳 200，不代表 job 完成。
+# 此 sub-workflow 輪詢 execution 直到 status.completionTime 出現後才返回。
+wait_for_execution:
+  params: [exec_url, step_name, order_id]
+  steps:
+    - init:
+        assign:
+          - attempts: 0
+          - max_attempts: 120   # 120 × 15s = 30 分鐘上限
+
+    - poll:
+        call: http.get
+        args:
+          url: ${exec_url}
+          auth:
+            type: OAuth2
+        result: exec
+
+    - check_timeout:
+        switch:
+          - condition: ${attempts >= max_attempts}
+            raise:
+              code: 408
+              message: '${step_name + " execution timed out for order: " + order_id}'
+
+    - check_done:
+        switch:
+          - condition: ${"completionTime" in exec.body.status}
+            next: evaluate
+
+    - increment_and_sleep:
+        steps:
+          - increment:
+              assign:
+                - attempts: ${attempts + 1}
+          - sleep:
+              call: sys.sleep
+              args:
+                seconds: 15
+          - loop:
+              next: poll
+
+    - evaluate:
+        switch:
+          - condition: ${exec.body.status.succeededCount == 0}
+            raise:
+              code: 500
+              message: '${step_name + " job failed for order: " + order_id}'
+        return: ${exec.body.status}
+
 
 # ── Retry predicate（5xx 和 timeout 才 retry，4xx 不 retry）────────────────
 default_retry_predicate:

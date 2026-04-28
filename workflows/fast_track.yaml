@@ -21,7 +21,7 @@ main:
           - pipeline_env: ${sys.get_env("ENV", "dev")}
           - api_base: ${sys.get_env("API_BASE_URL")}
           - base_job_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs"}'
-          - exec_base_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/"}'
+          - exec_base_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/executions/"}'
 
     # ── Step 1: Pre-process ───────────────────────────────────────────────────
     - log_preprocess_start:

@@ -132,6 +132,10 @@ main:
         switch:
           - condition: ${must_fix_response.body.total > 0}
             steps:
+              - init_human_qa:
+                  assign:
+                    - human_qa_polls: 0
+                    - human_qa_max_polls: 24
               - notify_human_qa:
                   call: http.post
                   args:
@@ -146,7 +150,16 @@ main:
               - wait_for_human_qa:
                   call: sys.sleep
                   args:
-                    seconds: 3600   # 輪詢間隔 1 小時，最多等 24 小時
+                    seconds: 3600
+              - increment_human_qa_polls:
+                  assign:
+                    - human_qa_polls: ${human_qa_polls + 1}
+              - check_human_qa_timeout:
+                  switch:
+                    - condition: ${human_qa_polls >= human_qa_max_polls}
+                      raise:
+                        code: 408
+                        message: '${"Human QA timed out (24h) for order: " + order_id}'
               - poll_human_qa:
                   call: http.get
                   args:
@@ -161,7 +174,7 @@ main:
               - check_all_resolved:
                   switch:
                     - condition: ${poll_result.body.total > 0}
-                      next: wait_for_human_qa   # 繼續等待
+                      next: wait_for_human_qa
 
     # ── Step 5: Deliver ───────────────────────────────────────────────────────
     - log_deliver_start:

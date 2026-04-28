@@ -267,10 +267,12 @@ wait_for_execution:
 
     - evaluate:
         switch:
-          - condition: ${exec.body.status.succeededCount == 0}
+          - condition: ${("failedCount" in exec.body.status and exec.body.status.failedCount > 0) or not("succeededCount" in exec.body.status) or exec.body.status.succeededCount == 0}
             raise:
               code: 500
               message: '${step_name + " job failed for order: " + order_id}'
+
+    - return_status:
         return: ${exec.body.status}
 
 

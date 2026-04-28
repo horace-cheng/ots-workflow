@@ -175,6 +175,8 @@ main:
                   switch:
                     - condition: ${poll_result.body.total > 0}
                       next: wait_for_human_qa
+              - proceed_to_deliver:
+                  next: log_deliver_start
 
     # ── Step 5: Deliver ───────────────────────────────────────────────────────
     - log_deliver_start:

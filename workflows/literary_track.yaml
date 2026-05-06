@@ -20,10 +20,11 @@ main:
           - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
           - region: "asia-east1"
           - pipeline_env: ${sys.get_env("ENV", "dev")}
-          - api_base: ${sys.get_env("API_BASE_URL")}
           - api_base: '${"https://ots-api-backend-" + pipeline_env + "-" + project_id + ".asia-east1.run.app"}'
+          - base_job_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs"}'
+          - exec_base_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/executions/"}'
           - poll_interval: 3600    # 每小時輪詢一次
-          - editor_timeout: 172800  # 48 小時 editor timeout
+          - editor_timeout: 604800  # 7 天 editor timeout (文學翻譯需要較長時間)
 
     # ── Step 1: Pre-process + NMT（AI 初稿）──────────────────────────────────
     - log_nmt_start:
@@ -33,32 +34,31 @@ main:
           severity: INFO
 
     - run_preprocess_nmt:
-        try:
-          call: http.post
-          args:
-            url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-lt-preprocess-nmt-" + pipeline_env + ":run"}'
-            auth:
-              type: OAuth2
-            body:
-              overrides:
-                containerOverrides:
-                  - env:
-                    - name: ORDER_ID
-                      value: ${order_id}
-          result: nmt_result
-        retry:
-          predicate: ${default_retry_predicate}
-          max_retries: 2
-          backoff:
-            initial_delay: 10
-            max_delay: 60
-            multiplier: 2
+        call: http.post
+        args:
+          url: '${base_job_url + "/ots-lt-preprocess-nmt-" + pipeline_env + ":run"}'
+          auth:
+            type: OAuth2
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                  - name: ORDER_ID
+                    value: ${order_id}
+        result: nmt_result
+
+    - wait_preprocess_nmt:
+        call: wait_for_execution
+        args:
+          exec_url: '${exec_base_url + nmt_result.body.metadata.name}'
+          step_name: "preprocess_nmt"
+          order_id: ${order_id}
 
     # ── Step 2: 通知 Admin 指派編輯 ───────────────────────────────────────────
     - notify_assign_editor:
         call: http.post
         args:
-          url: ${api_base + "/internal/notify"}
+          url: '${api_base + "/internal/notify"}'
           auth:
             type: OIDC
           body:
@@ -72,7 +72,7 @@ main:
           text: '${"[Literary Track] Waiting for editor assignment: " + order_id}'
           severity: INFO
 
-    # ── Step 3: 等待 editor 完成（輪詢，最多 48 小時）───────────────────────
+    # ── Step 3: 等待 editor 完成（輪詢，最多 7 天）──────────────────────────
     - init_editor_wait:
         assign:
           - editor_waited: 0
@@ -87,7 +87,7 @@ main:
                     - editor_timeout_notify:
                         call: http.post
                         args:
-                          url: ${api_base + "/internal/notify"}
+                          url: '${api_base + "/internal/notify"}'
                           auth:
                             type: OIDC
                           body:
@@ -100,7 +100,7 @@ main:
           - get_assignment_status:
               call: http.get
               args:
-                url: ${api_base + "/admin/assignments/" + order_id}
+                url: '${api_base + "/admin/assignments/" + order_id}'
                 auth:
                   type: OIDC
               result: assignment_response
@@ -132,18 +132,18 @@ main:
     - notify_assign_proofreader:
         call: http.post
         args:
-          url: ${api_base + "/internal/notify"}
+          url: '${api_base + "/internal/notify"}'
           auth:
             type: OIDC
           body:
             type: "literary_assign_proofreader"
             order_id: ${order_id}
 
-    # ── Step 5: 等待 proofreader 完成（最多 24 小時）────────────────────────
+    # ── Step 5: 等待 proofreader 完成（最多 48 小時）────────────────────────
     - init_proof_wait:
         assign:
           - proof_waited: 0
-          - proof_timeout: 86400   # 24 小時
+          - proof_timeout: 172800   # 48 小時
 
     - poll_proof_loop:
         steps:
@@ -154,7 +154,7 @@ main:
                     - proof_timeout_notify:
                         call: http.post
                         args:
-                          url: ${api_base + "/internal/notify"}
+                          url: '${api_base + "/internal/notify"}'
                           auth:
                             type: OIDC
                           body:
@@ -167,7 +167,7 @@ main:
           - get_proof_status:
               call: http.get
               args:
-                url: ${api_base + "/admin/assignments/" + order_id}
+                url: '${api_base + "/admin/assignments/" + order_id}'
                 auth:
                   type: OIDC
               result: proof_response
@@ -190,11 +190,11 @@ main:
           text: '${"[Literary Track] Proofreading done for order: " + order_id}'
           severity: INFO
 
-    # ── Step 6: Auto QA + Checklist ──────────────────────────────────────────
+    # ── Step 6: Auto QA Checklist ─────────────────────────────────────────────
     - run_qa_checklist:
         call: http.post
         args:
-          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-lt-qa-checklist-" + pipeline_env + ":run"}'
+          url: '${base_job_url + "/ots-lt-qa-checklist-" + pipeline_env + ":run"}'
           auth:
             type: OAuth2
           body:
@@ -205,11 +205,18 @@ main:
                     value: ${order_id}
         result: qa_result
 
-    # ── Step 7: Deliver（試譯包格式化 + 通知）────────────────────────────────
+    - wait_qa_checklist:
+        call: wait_for_execution
+        args:
+          exec_url: '${exec_base_url + qa_result.body.metadata.name}'
+          step_name: "qa_checklist"
+          order_id: ${order_id}
+
+    # ── Step 7: Deliver ───────────────────────────────────────────────────────
     - run_deliver:
         call: http.post
         args:
-          url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs/ots-lt-deliver-" + pipeline_env + ":run"}'
+          url: '${base_job_url + "/ots-lt-deliver-" + pipeline_env + ":run"}'
           auth:
             type: OAuth2
           body:
@@ -219,6 +226,13 @@ main:
                   - name: ORDER_ID
                     value: ${order_id}
         result: deliver_result
+
+    - wait_deliver:
+        call: wait_for_execution
+        args:
+          exec_url: '${exec_base_url + deliver_result.body.metadata.name}'
+          step_name: "deliver"
+          order_id: ${order_id}
 
     - log_complete:
         call: sys.log
@@ -243,7 +257,7 @@ main:
           - notify_admin_error:
               call: http.post
               args:
-                url: ${api_base + "/internal/notify"}
+                url: '${api_base + "/internal/notify"}'
                 auth:
                   type: OIDC
                 body:
@@ -251,7 +265,60 @@ main:
                   order_id: ${order_id}
                   track: "literary"
 
-# ── Retry predicate ───────────────────────────────────────────────────────────
+
+# ── 等待 Cloud Run Job 執行完成 ───────────────────────────────────────────────
+wait_for_execution:
+  params: [exec_url, step_name, order_id]
+  steps:
+    - init:
+        assign:
+          - attempts: 0
+          - max_attempts: 480   # 480 × 15s = 2 小時上限（LT 翻譯可能較慢）
+
+    - poll:
+        call: http.get
+        args:
+          url: ${exec_url}
+          auth:
+            type: OAuth2
+        result: exec
+
+    - check_timeout:
+        switch:
+          - condition: ${attempts >= max_attempts}
+            raise:
+              code: 408
+              message: '${step_name + " execution timed out for order: " + order_id}'
+
+    - check_done:
+        switch:
+          - condition: ${"completionTime" in exec.body.status}
+            next: evaluate
+
+    - increment_and_sleep:
+        steps:
+          - increment:
+              assign:
+                - attempts: ${attempts + 1}
+          - sleep:
+              call: sys.sleep
+              args:
+                seconds: 15
+          - loop:
+              next: poll
+
+    - evaluate:
+        switch:
+          - condition: ${("failedCount" in exec.body.status and exec.body.status.failedCount > 0) or not("succeededCount" in exec.body.status) or exec.body.status.succeededCount == 0}
+            raise:
+              code: 500
+              message: '${step_name + " job failed for order: " + order_id}'
+
+    - return_status:
+        return: ${exec.body.status}
+
+
+# ── Retry predicate（5xx 和 timeout 才 retry，4xx 不 retry）────────────────
 default_retry_predicate:
   params: [exception]
   steps:

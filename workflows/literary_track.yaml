@@ -2,8 +2,11 @@
 # OTS Literary Track — Cloud Workflows Definition
 # =============================================================================
 # 觸發：Pub/Sub 訊息（order_id, track_type=literary）
-# 步驟：preprocess+nmt → notify_editor → wait_editor → notify_proofreader
+# 步驟：preprocess+nmt → qa_auto → notify_editor → wait_editor → notify_proofreader
 #        → wait_proofreader → qa_checklist → deliver
+#
+# Auto QA runs on NMT output BEFORE editor — flags are visible to editor
+# so they can be fixed during the editing pass.
 #
 # Literary Track 的人工步驟（editor, proofreader）透過輪詢 API 確認完成狀態，
 # 不用 webhook，避免長時間等待的 workflow state 管理複雜化。
@@ -20,10 +23,10 @@ main:
           - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
           - region: "asia-east1"
           - pipeline_env: ${sys.get_env("ENV", "dev")}
-          - api_base: '${"https://ots-api-backend-" + pipeline_env + "-" + project_id + ".asia-east1.run.app"}'
+          - api_base: ${sys.get_env("API_BASE_URL")}
           - base_job_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/jobs"}'
           - exec_base_url: '${"https://" + region + "-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/" + project_id + "/executions/"}'
-          - poll_interval: 3600    # 每小時輪詢一次
+          - poll_interval: 120    # 每2分鐘輪詢一次
           - editor_timeout: 604800  # 7 天 editor timeout (文學翻譯需要較長時間)
 
     # ── Step 1: Pre-process + NMT（AI 初稿）──────────────────────────────────
@@ -54,7 +57,37 @@ main:
           step_name: "preprocess_nmt"
           order_id: ${order_id}
 
-    # ── Step 2: 通知 Admin 指派編輯 ───────────────────────────────────────────
+    # ── Step 2: Auto QA on NMT output（flags visible to editor）───────────────
+    - log_qa_auto_start:
+        call: sys.log
+        args:
+          text: '${"[Literary Track] Starting auto QA on NMT output for order: " + order_id}'
+          severity: INFO
+
+    - run_qa_auto:
+        call: http.post
+        args:
+          url: '${base_job_url + "/ots-lt-qa-checklist-" + pipeline_env + ":run"}'
+          auth:
+            type: OAuth2
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                  - name: ORDER_ID
+                    value: ${order_id}
+                  - name: SKIP_STATUS_UPDATE
+                    value: "true"
+        result: qa_auto_result
+
+    - wait_qa_auto:
+        call: wait_for_execution
+        args:
+          exec_url: '${exec_base_url + qa_auto_result.body.metadata.name}'
+          step_name: "qa_auto"
+          order_id: ${order_id}
+
+    # ── Step 3: 通知 Admin 指派編輯 ───────────────────────────────────────────
     - notify_assign_editor:
         call: http.post
         args:
@@ -72,7 +105,7 @@ main:
           text: '${"[Literary Track] Waiting for editor assignment: " + order_id}'
           severity: INFO
 
-    # ── Step 3: 等待 editor 完成（輪詢，最多 7 天）──────────────────────────
+    # ── Step 4: 等待 editor 完成（輪詢，最多 7 天）──────────────────────────
     - init_editor_wait:
         assign:
           - editor_waited: 0
@@ -100,7 +133,7 @@ main:
           - get_assignment_status:
               call: http.get
               args:
-                url: '${api_base + "/admin/assignments/" + order_id}'
+                url: '${api_base + "/internal/assignments/" + order_id}'
                 auth:
                   type: OIDC
               result: assignment_response
@@ -128,7 +161,7 @@ main:
           text: '${"[Literary Track] Editor done for order: " + order_id}'
           severity: INFO
 
-    # ── Step 4: 通知 Admin 指派母語校對 ──────────────────────────────────────
+    # ── Step 5: 通知 Admin 指派母語校對 ──────────────────────────────────────
     - notify_assign_proofreader:
         call: http.post
         args:
@@ -139,7 +172,7 @@ main:
             type: "literary_assign_proofreader"
             order_id: ${order_id}
 
-    # ── Step 5: 等待 proofreader 完成（最多 48 小時）────────────────────────
+    # ── Step 6: 等待 proofreader 完成（最多 48 小時）────────────────────────
     - init_proof_wait:
         assign:
           - proof_waited: 0
@@ -167,7 +200,7 @@ main:
           - get_proof_status:
               call: http.get
               args:
-                url: '${api_base + "/admin/assignments/" + order_id}'
+                url: '${api_base + "/internal/assignments/" + order_id}'
                 auth:
                   type: OIDC
               result: proof_response
@@ -190,7 +223,7 @@ main:
           text: '${"[Literary Track] Proofreading done for order: " + order_id}'
           severity: INFO
 
-    # ── Step 6: Auto QA Checklist ─────────────────────────────────────────────
+    # ── Step 7: Auto QA Checklist (final check before delivery) ──────────────
     - run_qa_checklist:
         call: http.post
         args:
@@ -212,7 +245,7 @@ main:
           step_name: "qa_checklist"
           order_id: ${order_id}
 
-    # ── Step 7: Deliver ───────────────────────────────────────────────────────
+    # ── Step 8: Deliver ───────────────────────────────────────────────────────
     - run_deliver:
         call: http.post
         args:

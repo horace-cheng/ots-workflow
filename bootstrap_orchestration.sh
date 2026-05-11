@@ -121,14 +121,16 @@ else
   ok "Subscription 建立完成：$SUB_WORKFLOW"
 fi
 
-# API Backend SA 需要 publisher 權限（才能發 pipeline trigger 訊息）
+# API Backend SA 需要 publisher 權限（才能發 pipeline trigger + notify 訊息）
 SA_API_EMAIL="ots-api-backend-${ENV}@${PROJECT_ID}.iam.gserviceaccount.com"
-gcloud pubsub topics add-iam-policy-binding "$TOPIC_PIPELINE" \
-  --member="serviceAccount:${SA_API_EMAIL}" \
-  --role="roles/pubsub.publisher" \
-  --project="$PROJECT_ID" \
-  --quiet
-ok "API Backend SA publisher 權限設定完成"
+for topic in "$TOPIC_PIPELINE" "$TOPIC_NOTIFY"; do
+  gcloud pubsub topics add-iam-policy-binding "$topic" \
+    --member="serviceAccount:${SA_API_EMAIL}" \
+    --role="roles/pubsub.publisher" \
+    --project="$PROJECT_ID" \
+    --quiet
+  ok "API Backend SA → ${topic} publisher 權限設定完成"
+done
 
 # =============================================================================
 # 3. CLOUD TASKS QUEUES
